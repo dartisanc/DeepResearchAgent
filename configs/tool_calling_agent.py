@@ -9,6 +9,8 @@ with read_base():
     from .tools.plotter import plotter_tool
     from .tools.bash import bash_tool
     from .tools.todo import todo_tool
+    from .tools.skill_generator import skill_generator_tool
+    from .tools.ai_capability_debate import ai_capability_debate_tool
     from .environments.file_system import environment as file_system_environment
     from .memory.general_memory_system import memory_system as general_memory_system
     from .memory.optimizer_memory_system import memory_system as optimizer_memory_system
@@ -19,8 +21,8 @@ log_path = "agent.log"
 
 use_local_proxy = True
 version = "0.1.0"
-# model_name = "openrouter/gemini-3-flash-preview"
-model_name = "openrouter/claude-sonnet-4.5"
+model_name = "openrouter/gemini-3-flash-preview"
+# model_name = "openrouter/claude-sonnet-4.5"
 
 env_names = [
     "file_system"
@@ -33,8 +35,8 @@ agent_names = [
     "tool_calling"
 ]
 tool_names = [
-    # 'bash',
-    # 'python_interpreter',
+    'bash',
+    'python_interpreter',
     'done',
     'todo',
     # 'mdify',
@@ -42,6 +44,11 @@ tool_names = [
     # "deep_researcher",
     # "browser",
     # "plotter",
+    "skill_generator",
+    "ai_capability_debate",
+]
+skill_names = [
+    "hello-world",
 ]
 
 #-----------------BASH TOOL CONFIG-----------------
@@ -79,7 +86,22 @@ plotter_tool.update(
     model_name="openrouter/o3",
     base_dir="tool/plotter",
 )
-
+#-----------------SKILL GENERATOR TOOL CONFIG-----------------
+skill_generator_tool.update(
+    model_name="openrouter/gemini-3-flash-preview",
+    base_dir="skill",
+)
+#-----------------AI CAPABILITY DEBATE TOOL CONFIG-----------------
+ai_capability_debate_tool.update(
+    model_name="openrouter/gemini-3-flash-preview",
+    agent_models=[
+        "openrouter/gemini-3-flash-preview",
+        "openrouter/gpt-5.2",
+        "openrouter/claude-sonnet-4.5",
+        "openrouter/grok-4.1-fast",
+    ],
+    base_dir="tool/ai_capability_debate",
+)
 #-----------------MEMORY SYSTEM CONFIG-----------------
 general_memory_system.update(
     base_dir="memory/general_memory_system",

@@ -5,6 +5,7 @@ from .aime25 import AIME25Benchmark
 from .gpqa import GPQABenchmark
 from .leetcode import LeetCodeBenchmark
 from .gsm8k import GSM8kBenchmark
+from .hle import HLEBenchmark
 
 __all__ = [
     "Benchmark",
@@ -16,4 +17,5 @@ __all__ = [
     "GPQABenchmark",
     "LeetCodeBenchmark",
     "GSM8kBenchmark",
+    "HLEBenchmark",
 ]

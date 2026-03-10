@@ -1034,16 +1034,14 @@ class AgentContextManager(BaseModel):
     async def save_contract(self, agent_names: Optional[List[str]] = None):
         """Save the contract for an agent"""
         contract = []
-        if agent_names is not None:
-            for index, agent_name in enumerate(agent_names):
-                agent_info = await self.get_info(agent_name)
-                text = agent_info.text
-                contract.append(f"{index + 1:04d}\n{text}\n")
-        else:
-            for index, agent_name in enumerate(self._agent_configs.keys()):
-                agent_info = await self.get_info(agent_name)
-                text = agent_info.text
-                contract.append(f"{index + 1:04d}\n{text}\n")
+        names = agent_names if agent_names is not None else list(self._agent_configs.keys())
+        for index, agent_name in enumerate(names):
+            agent_info = await self.get_info(agent_name)
+            if agent_info is None:
+                logger.warning(f"| ⚠️  Skipping agent '{agent_name}' in contract (not found or failed to create)")
+                continue
+            text = agent_info.text
+            contract.append(f"{index + 1:04d}\n{text}\n")
         contract_text = "---\n".join(contract)
         with open(self.contract_path, "w", encoding="utf-8") as f:
             f.write(contract_text)
@@ -1258,6 +1256,7 @@ class AgentContextManager(BaseModel):
             name: Agent name
             input: Input for the agent
             ctx: Agent context
+            **kwargs: Additional keyword arguments forwarded to the agent
         Returns:
             Agent result
         """
@@ -1266,9 +1265,10 @@ class AgentContextManager(BaseModel):
         
         agent_info = await self.get_info(name)
         
-        # Agent args
+        # Agent args: ctx + any extra kwargs from the caller
         agent_args = {
             "ctx": ctx,
+            **kwargs,
         }
         
         version = agent_info.version

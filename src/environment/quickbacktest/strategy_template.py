@@ -11,22 +11,26 @@ class AgentStrategy(BaseStrategy):
 
     This class defines **how trading actions are executed**.
     The execution backend is **Backtrader**.
+    When coding, always use tz-aware DatetimeIndex.
 
     Describe the strategy logic in the docstring of this class
     following the format 
 
-    Strategy Logic Overview
-      — handle_signal: explain entry and reversal logic
-      — handle_stop_loss: explain risk exit logic
-      — handle_take_profit: explain profit-taking logic
+    Example: module name: MyStrategy  -> class name: MyStrategy
 
+    Strategy Logic Overview
+      - handle_signal: explain entry and reversal logic
+      - handle_stop_loss: explain risk exit logic
+      - handle_take_profit: explain profit-taking logic
+
+    Keep the class name same as module name for dynamic loading.
 
 
     All trading operations described here are ultimately translated
     into Backtrader orders (Market orders by default).
 
     Insights:
-    - Reduce frenquent trading by introducing time
+    - Reduce frequent trading by introducing time
 
     Example:
     def _run(self, symbol: str) -> None:
@@ -52,15 +56,15 @@ class AgentStrategy(BaseStrategy):
 
     Data are predefined by BaseStrategy and include in __init___:
     call super().__init__() first to initialize BaseStrategy if you override __init__ # DO NOT INCLUDE ARGS
-        self.signal: Dict = {d._name: d.signal for d in self.datas}
-        self.factor1: Dict = {d._name: d.factor1 for d in self.datas}
-        self.factor2: Dict = {d._name: d.factor2 for d in self.datas}
+        self.signal_1: Dict = {d._name: d.signal_1 for d in self.datas}
+        self.signal_2: Dict = {d._name: d.signal_2 for d in self.datas}
+        self.signal_3: Dict = {d._name: d.signal_3 for d in self.datas}
 
     Data can be accessed using:
-    self.signal[symbol][0], self.factor1[symbol][0], etc.
+    self.signal_1[symbol][0], self.signal_2[symbol][0], self.signal_3[symbol][0]
 
     BaseStrategy only guarantees:
-      self.signal / self.factor1 / self.factor2
+      self.signal_1 / self.signal_2 / self.signal_3
 
     Therefore, this strategy MUST NOT access:
       self.high / self.low / self.close / self.open ..
@@ -121,8 +125,7 @@ class AgentStrategy(BaseStrategy):
          - Often used for take-profit or protective exits
 
        Backtrader execution:
-         - Uses self.close(data=data)
-         - please followed by self.log(f"{symbol} your reason", verbose=self.p.verbose) to log the action
+         - Uses self._close_position(data, reason: str)
 
        Position change:
          - +size → 0

@@ -13,30 +13,79 @@ class AgentSignal(BaseSignal):
 
     This class prepares trading inputs for the strategy.
     It does NOT execute trades.
-    Avoid look-head bias when generating signals and factors.
+    Avoid look-head bias when generating signals.
+    When coding, always use tz-aware DatetimeIndex.
 
-    Write docstrings for the class at here. Follow the format below (to describe the meaning of each singnal and factor):
+    Keep the class name same as module name for dynamic loading.
+
+    Example: module name: MySignal  -> class name: MySignal
+
+    Write docstrings for the class at here. Follow the format below (to describe the meaning of each singnal and factor)
+    Do not include anything else here except the dictionary style docstring, follow strick json format.
+
+    Leave range number all be -1 when generating the docstring.
+
+    Update and Add module will trigger getSignalQuantile tool to update the range automatically and return the updated range information as output.
+
+    You can also use getdocstring tool to get the docstring after updating the range.
+
+    Do not update range by yourself.
+
+    Name follow convention {key_variable}_{version}, e.g. momentum_v1, volatility_v1, etc.
+    
+
 
                     {
-                        "signal":{
+                        "signal_1":{
                                     "name":string
-                                    "explain": string
+                                    "explanation": string
+                                    "range": {
+                                            "mean": float,
+                                            "std": float,
+                                            "min": float,
+                                            "25%": float,
+                                            "50%": float,
+                                            "75%": float ,
+                                            "max": float,
+                                        }
                         },
-                        "factor1":{
+                        "signal_2":{
                                     "name":string,
-                                    "explain":string
+                                    "explanation":string
+                                    "range": {
+                                        "mean": float,
+                                        "std": float,
+                                        "min": float,
+                                        "25%": float,
+                                        "50%": float,
+                                        "75%": float ,
+                                        "max": float,
+                                    }
+
                         },
-                        "factor2":{
+                        "signal_3":{
                                     "name":string,
-                                    "explain":string
-                        },
+                                    "explanation":string
+                                    "range": {
+                                        "mean": float,
+                                        "std": float,
+                                        "min": float,
+                                        "25%": float,
+                                        "50%": float,
+                                        "75%": float ,
+                                        "max": float,
+                                    }
+                            },
+
+                        "why_these_signals": string
                     }
 
+                    
     Outputs consumed by Strategy
     ----------------------------
-    - signal   : primary decision input (price / score / indicator) - can be understood as a factor with high IC value with returns
-    - factor1  : free-form auxiliary factor
-    - factor2  : free-form auxiliary factor
+    - signal_1   : primary decision input (price / score / indicator) - can be understood as a factor with high IC value with returns
+    - signal_2   : secondary decision input (price / score / indicator) - can be understood as a factor with high IC value with returns
+    - signal_3   : tertiary decision input (price / score / indicator) - can be understood as a factor with high IC value with returns
 
     Data has been initlized in BaseSignal in the format:
 
@@ -61,25 +110,18 @@ class AgentSignal(BaseSignal):
 
     """
 
-    def get_signal(self, **kwargs) -> pd.DataFrame:
-        """Generate signal (main strategy input)."""
+    def get_signals(self, **kwargs) -> pd.DataFrame:
+        """Generate signal DataFrame with columns: signal_1, signal_2, signal_3"""
         pass
 
-    def get_factors(
-        self,
-        factor_name: Literal["factor1", "factor2"],
-        **kwargs
-    ) -> pd.DataFrame:
-        """Generate factor1 or factor2 (free-form auxiliary factors)."""
-        pass
 
-    def concat_signal(self, data: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    def concat_signals(self, data: pd.DataFrame, **kwargs) -> pd.DataFrame:
         """
-        Attach signal / factor1 / factor2 back to the original OHLCV data.
+        Attach signal_1 / signal_2 / signal_3 back to the original OHLCV data.
 
         What this method does (trading pipeline view)
         ---------------------------------------------
-        - Convert wide matrices (signal / factors) into long format
+        - Convert wide matrices (signal_1 / signal_2 / signal_3) into long format
         - Align everything by (trade_time, code)
         - Return a long table that can be fed into Backtrader datafeeds
 
@@ -87,28 +129,35 @@ class AgentSignal(BaseSignal):
         -----------------------
         - trade_time
         - code
-        - signal
-        - factor1
-        - factor2
+        - signal_1
+        - signal_2
+        - signal_3
         - vwap
+
+        if you need resample the data into highr level, e.g. from 1m to 1D, please make sure to use .shift(1) to prevent look-ahead bias.
+        example:
+            close_s = self.close[code].resample('1D').last().shift(1)
+            high_s = self.high[code].resample('1D').max().shift(1)
+            low_s = self.low[code].resample('1D').min().shift(1)
+        MUST DO IT THIS WAY!!!
 
         vwaps: pd.DataFrame = self.calculate_rolling_vwap(window:int) # ALREADY IMPLEMENTED IN BaseSignal
 
         Example structure (illustrative only)
         -------------------------------------
-        # signal (wide)   -> index=trade_time, columns=code
-        # factor1 (wide)  -> index=trade_time, columns=code
-        # factor2 (wide)  -> index=trade_time, columns=code
+        # signal_1(wide)  -> index=trade_time, columns=code
+        # signal_2(wide)  -> index=trade_time, columns=code
+        # signal_3(wide)  -> index=trade_time, columns=code
 
         # Convert to long and merge:
         #
-        # signal_long  = signal.stack().to_frame("signal")
-        # factor1_long = factor1.stack().to_frame("factor1")
-        # factor2_long = factor2.stack().to_frame("factor2")
+        # signal_1_long  = signal_1.stack().to_frame("signal_1")
+        # signal_2_long = signal_2.stack().to_frame("signal_2")
+        # signal_3_long = signal_3.stack().to_frame("signal_3")
         #
         # out = (
         #   data.set_index(["trade_time", "code"])
-        #       .join([signal_long, factor1_long, factor2_long])
+        #       .join([signal_1_long, signal_2_long, signal_3_long])
         #       .reset_index()
         #       .sort_values(["trade_time", "code"])
         # )

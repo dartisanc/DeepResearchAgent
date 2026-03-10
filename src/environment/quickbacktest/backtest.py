@@ -13,7 +13,7 @@ from collections import defaultdict
 __all__ = ["run_strategy", "COMMISSION"]
 # 设置初始金额及手续费
 COMMISSION: Dict = dict(
-    cash=1e8, commission=0.00015,slippage_perc=0.0001,leverage=1.0
+    cash=1e8, commission=5e-4,slippage_perc=0.0,leverage=1.0
 )
 
 # 设置策略参数
@@ -54,6 +54,7 @@ def backtest_strategy(
     strategy: bt.Strategy,
     strategy_kwargs: Dict = {},
     commission_kwargs: Dict = {},
+    number_of_signals: int = 3,
 ):
     commission_kwargs: Dict = update_params(COMMISSION, commission_kwargs)
     strategy_kwargs: Dict = update_params(STRATEGY_PARAMS, strategy_kwargs)
@@ -68,7 +69,11 @@ def backtest_strategy(
         df: pd.DataFrame = data.query("code in @code").copy()
         strategy_kwargs["hold_num"] = len(code)
 
-    df: pd.DataFrame = df.dropna(subset=["close","factor1","factor2","signal","vwap"])
+    
+    signals = [f"signal_{i+1}" for i in range(number_of_signals)]
+    required_columns = ["close","vwap"] + signals
+
+    df: pd.DataFrame = df.dropna(subset=required_columns)
     bt_engine = BackTesting(**commission_kwargs)
     bt_engine.load_data(
         df,
@@ -81,9 +86,16 @@ def backtest_strategy(
     )
     bt_engine.cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
     bt_engine.cerebro.addanalyzer(TotalCommission, _name="total_commission")
+    tmp_result = bt_engine.cerebro.run()
 
-    result = bt_engine.cerebro.run()[0]
 
+    try:
+        if not tmp_result:
+            raise RuntimeError("Zero trade were made")
+        result = tmp_result[0]
+    except Exception as e:
+        raise RuntimeError(f"Zero trade were made")
+    
     return result
 
 

@@ -1,36 +1,399 @@
-"""Planning agent implementation for task decomposition and sub-agent coordination."""
+"""Planning agent — pure LLM reasoning + plan.md management.
+
+Responsibility boundary
+-----------------------
+The PlanningAgent has exactly **two** responsibilities:
+
+1. **LLM reasoning**: given a task context (original task, available agents,
+   execution history), produce a ``PlanDecision`` — the structured answer to
+   "what should we do next?".
+2. **plan.md management**: maintain a ``plan.md`` file in ``workdir/<session_id>/``
+   that records every round's decisions, dispatches, results, and analysis.
+
+It does **NOT**:
+- Import or call the AgentBus.
+- Dispatch sub-agents.
+- Run a multi-round loop.
+
+All dispatching, result collection, and loop control is the bus's job.
+The bus calls this agent once per round via ACP (``acp(name="planning", ...)``)
+and reads the returned ``PlanDecision`` to decide what to do next.
+
+Call contract
+-------------
+The bus passes a dict-serialised context as ``task`` (the string).
+The planner returns ``AgentResponse`` with ``extra.data["decision"]``
+containing the serialised ``PlanDecision``.
+
+To feed results back, the bus calls the planner again with an updated context
+string that includes the previous execution history.
+"""
+
+from __future__ import annotations
 
 import asyncio
 import os
-from typing import List, Optional, Dict, Any
-from langchain_core.messages import BaseMessage
-from datetime import datetime
-from pydantic import Field, ConfigDict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-from src.agent.types import Agent, AgentResponse, AgentExtra, ThinkOutput
-from src.config import config
+from pydantic import BaseModel, ConfigDict, Field
+
+from src.agent.types import Agent, AgentExtra, AgentResponse
 from src.logger import logger
-from src.utils import dedent
-from src.tool.server import tcp
-from src.agent.server import acp
-from src.environment.server import ecp
-from src.memory import memory_manager, EventType
-from src.tool.types import ToolResponse
-from src.tracer import Tracer, Record
 from src.model import model_manager
+from src.prompt import prompt_manager
 from src.registry import AGENT
 from src.session import SessionContext
 
+
+# ---------------------------------------------------------------------------
+# LLM structured-output schema
+# ---------------------------------------------------------------------------
+
+class SubTaskDispatch(BaseModel):
+    """One sub-task to dispatch to a named agent."""
+
+    agent_name: str = Field(
+        description="Exact name of the agent to call (must match an available agent)."
+    )
+    task: str = Field(
+        description="The sub-task description to send to this agent."
+    )
+    files: List[str] = Field(
+        default_factory=list,
+        description="Optional file paths to attach.",
+    )
+
+
+class PlanDecision(BaseModel):
+    """Structured output the LLM produces for each planning round.
+
+    The AgentBus reads this to determine what to dispatch next.
+    """
+
+    thinking: str = Field(
+        description="Chain-of-thought reasoning about the current state."
+    )
+    analysis: str = Field(
+        description=(
+            "Evaluation of the previous round's results. "
+            "Leave empty on the first round."
+        ),
+    )
+    plan_update: str = Field(
+        description="Updated high-level description of the overall plan."
+    )
+    dispatches: List[SubTaskDispatch] = Field(
+        default_factory=list,
+        description=(
+            "Sub-tasks to dispatch in this round.  All listed agents will "
+            "run concurrently on the bus.  Must be empty when is_done=True."
+        ),
+    )
+    is_done: bool = Field(
+        default=False,
+        description="Set True only when the entire original task is fully complete.",
+    )
+    final_result: Optional[str] = Field(
+        default=None,
+        description="Comprehensive final answer.  Required when is_done=True.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# plan.md data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PlanRound:
+    """Execution record for one planning round."""
+
+    number: int
+    goal: str
+    agents: List[str]
+    delivery_mode: str              # "UNICAST" | "BROADCAST"
+    subtasks: Dict[str, str]        # agent_name → task text
+    results: Dict[str, Any]         # agent_name → {success, result, error}
+    analysis: str = ""
+    timestamp: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+
+
+class PlanFile:
+    """Manages the ``plan.md`` file for a single planning session.
+
+    Structure mirrors Cursor plan files::
+
+        ---
+        name: <title>
+        overview: "<task description>"
+        todos:
+          - id: step-1-agent_name
+            content: "agent_name: subtask description"
+            status: completed | pending
+        isProject: false
+        ---
+
+        # <title>
+
+        ## Execution Flow
+        ```mermaid
+        graph LR
+          subgraph execution [Execution Flow]
+            s1[Step 1: agent] --> s2[Step 2: agent]
+          end
+        ```
+
+        ## Execution Log
+        ### Round N — <timestamp>
+        ...
+
+        ## Final Result
+        ...
+    """
+
+    def __init__(self, path: str, task: str, task_id: str, session_id: str) -> None:
+        self.path = path
+        self.full_task = task
+        self.task_title = (task[:70] + "...") if len(task) > 70 else task
+        self.task_id = task_id
+        self.session_id = session_id
+        self.status = "running"
+        self.created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.rounds: List[PlanRound] = []
+        self.final_result: Optional[str] = None
+
+    # -- mutation ----------------------------------------------------------
+
+    def add_round(self, round_: PlanRound) -> None:
+        self.rounds.append(round_)
+
+    def update_last_analysis(self, analysis: str) -> None:
+        if self.rounds and analysis:
+            self.rounds[-1].analysis = analysis
+
+    def finalize(self, result: str, success: bool) -> None:
+        self.status = "done" if success else "failed"
+        self.final_result = result
+
+    # -- persistence -------------------------------------------------------
+
+    async def save(self) -> None:
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        content = self._render()
+        await asyncio.to_thread(self._write_sync, content)
+
+    def _write_sync(self, content: str) -> None:
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+
+    # -- context for LLM (plain text, no mermaid) --------------------------
+
+    def execution_log_text(self) -> str:
+        """Plain-text execution log passed to the LLM as context."""
+        if not self.rounds:
+            return "(no rounds completed yet)"
+        lines: List[str] = []
+        for r in self.rounds:
+            lines.append(f"=== Round {r.number} — {r.timestamp} ===")
+            lines.append(f"Goal: {r.goal}")
+            lines.append(f"Dispatched ({r.delivery_mode}): {', '.join(r.agents)}")
+            for agent in r.agents:
+                lines.append(f"  {agent} subtask: {r.subtasks.get(agent, '')[:200]}")
+            lines.append("Results:")
+            for agent, res in r.results.items():
+                ok = res.get("success", False)
+                text = str(res.get("result") or res.get("error") or "")[:300]
+                lines.append(f"  {'OK' if ok else 'FAIL'} {agent}: {text}")
+            if r.analysis:
+                lines.append(f"Analysis: {r.analysis[:300]}")
+            lines.append("")
+        return "\n".join(lines)
+
+    # -- rendering ---------------------------------------------------------
+
+    @staticmethod
+    def _node_id(name: str) -> str:
+        return name.replace("-", "_").replace(".", "_").replace(" ", "_")
+
+    def _build_todos(self) -> List[Dict[str, str]]:
+        """Build todo items from execution rounds for YAML frontmatter."""
+        todos: List[Dict[str, str]] = []
+        task_index = 0
+        for r in self.rounds:
+            for a in r.agents:
+                task_index += 1
+                st = r.subtasks.get(a, "")[:200]
+                res = r.results.get(a, {})
+                ok = res.get("success")
+                if ok is True:
+                    status = "completed"
+                elif ok is False:
+                    status = "completed"
+                else:
+                    status = "pending"
+                todo_id = f"step-{task_index}-{self._node_id(a)}"
+                todos.append({
+                    "id": todo_id,
+                    "content": f"{a}: {st}",
+                    "status": status,
+                })
+        return todos
+
+    @staticmethod
+    def _yaml_escape(s: str) -> str:
+        """Escape a string for use as a YAML double-quoted value."""
+        return s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ')
+
+    def _render_mermaid(self) -> List[str]:
+        lines = ["```mermaid", "graph LR"]
+        agent_rounds = [r for r in self.rounds if r.agents]
+
+        if not agent_rounds:
+            title = self.task_title[:40].replace('"', "'")
+            lines.append("  subgraph plan [Plan]")
+            lines.append(f'    start(["{title}"])')
+            if self.status in ("done", "failed"):
+                lines.append(f'    start --> finish(["{self.status}"])')
+            lines.append("  end")
+            lines.append("```")
+            return lines
+
+        lines.append("  subgraph execution [Execution Flow]")
+        task_index = 0
+        prev_id = None
+        for r in agent_rounds:
+            for a in r.agents:
+                task_index += 1
+                a_id = f"s{task_index}"
+                label = f"Step {task_index}: {a}"
+                lines.append(f"    {a_id}[{label}]")
+                if prev_id:
+                    lines.append(f"    {prev_id} --> {a_id}")
+                prev_id = a_id
+
+        if self.status == "done" and prev_id:
+            lines.append("    finish([Done])")
+            lines.append(f"    {prev_id} --> finish")
+        elif self.status == "failed" and prev_id:
+            lines.append("    finish([Failed])")
+            lines.append(f"    {prev_id} --> finish")
+
+        lines.append("  end")
+        lines.append("```")
+        return lines
+
+    def _render_round(self, r: PlanRound) -> List[str]:
+        lines: List[str] = [f"### Round {r.number} — {r.timestamp}", ""]
+        lines.append(f"> {r.goal}")
+        lines.append("")
+        if r.agents:
+            lines.append(f"**Dispatched ({r.delivery_mode}):** {', '.join(f'`{a}`' for a in r.agents)}")
+            lines.append("")
+            for a in r.agents:
+                st = r.subtasks.get(a, "")[:300]
+                res = r.results.get(a, {})
+                ok = res.get("success")
+                if ok is True:
+                    lines.append(f"- [x] **`{a}`**: {st}")
+                    result_text = str(res.get("result") or "")[:200]
+                    if result_text:
+                        lines.append(f"  - Result: {result_text}")
+                elif ok is False:
+                    err = str(res.get("error") or "")[:200]
+                    lines.append(f"- [x] ~~**`{a}`**: {st}~~ ❌")
+                    if err:
+                        lines.append(f"  - Error: {err}")
+                else:
+                    lines.append(f"- [ ] **`{a}`**: {st}")
+            lines.append("")
+        if r.analysis:
+            lines += ["**Analysis:**", f"> {r.analysis[:300]}", ""]
+        lines += ["---", ""]
+        return lines
+
+    def _render(self) -> str:
+        todos = self._build_todos()
+        esc = self._yaml_escape
+
+        # --- YAML frontmatter (Cursor plan format) ---
+        lines: List[str] = [
+            "---",
+            f"name: {self.task_title}",
+            f'overview: "{esc(self.full_task)}"',
+        ]
+        if todos:
+            lines.append("todos:")
+            for t in todos:
+                lines.append(f'  - id: {t["id"]}')
+                lines.append(f'    content: "{esc(t["content"])}"')
+                lines.append(f'    status: {t["status"]}')
+        else:
+            lines.append("todos: []")
+        lines.append("isProject: false")
+        lines.append("---")
+        lines.append("")
+
+        # --- Title ---
+        lines.append(f"# {self.task_title}")
+        lines.append("")
+
+        # --- Execution Flow (Mermaid) ---
+        lines.append("## Execution Flow")
+        lines.append("")
+        lines += self._render_mermaid()
+        lines += ["", ""]
+
+        # --- Execution Log ---
+        lines += ["## Execution Log", ""]
+        if not self.rounds:
+            lines += ["*(planning in progress...)*", ""]
+        else:
+            for r in self.rounds:
+                lines += self._render_round(r)
+
+        # --- Final Result ---
+        if self.final_result is not None:
+            tag = "Completed" if self.status == "done" else "Failed"
+            lines += [f"## Final Result — {tag}", "", self.final_result, ""]
+
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# PlanningAgent
+# ---------------------------------------------------------------------------
+
 @AGENT.register_module(force=True)
 class PlanningAgent(Agent):
-    """Planning agent for high-level reasoning, task decomposition, and adaptive planning."""
+    """Pure LLM planning agent.
+
+    One LLM call per invocation.  Returns a ``PlanDecision`` to the caller
+    (the AgentBus), which owns the multi-round loop and all dispatching.
+
+    Also maintains a ``plan.md`` file that records every round.  The bus
+    feeds results back by calling this agent again with an updated context,
+    and the agent appends the new round to plan.md before returning.
+    """
+
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
-    
-    name: str = Field(default="planning", description="The name of the planning agent.")
-    description: str = Field(default="A planning agent that decomposes complex tasks and coordinates sub-agents.", description="The description of the planning agent.")
-    metadata: Dict[str, Any] = Field(default={}, description="The metadata of the planning agent.")
-    require_grad: bool = Field(default=False, description="Whether the agent requires gradients")
-    
+
+    name: str = Field(default="planning")
+    description: str = Field(
+        default=(
+            "Decomposes tasks and decides which sub-agents to call next. "
+            "Returns a PlanDecision; the AgentBus drives the loop."
+        ),
+    )
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    require_grad: bool = Field(default=False)
+
+    # The PlanFile is stored per-session.  The bus creates it on the first
+    # call and passes it back via kwargs on subsequent calls.
+    _plan_files: Dict[str, PlanFile] = {}
+
     def __init__(
         self,
         workdir: str,
@@ -40,419 +403,181 @@ class PlanningAgent(Agent):
         model_name: Optional[str] = None,
         prompt_name: Optional[str] = None,
         memory_name: Optional[str] = None,
-        max_tools: int = 10,
-        max_steps: int = 20,
-        review_steps: int = 5,
         require_grad: bool = False,
-        **kwargs
+        **kwargs,
     ):
-        # Set default prompt name for planning
-        if not prompt_name:
-            prompt_name = "planning"
-        
         super().__init__(
             workdir=workdir,
             name=name,
             description=description,
             metadata=metadata,
             model_name=model_name,
-            prompt_name=prompt_name,
+            prompt_name=prompt_name or "planning",
             memory_name=memory_name,
-            max_tools=max_tools,
-            max_steps=max_steps,
-            review_steps=review_steps,
             require_grad=require_grad,
-            **kwargs)
-    
-    async def initialize(self):
-        """Initialize the agent."""
-        self.tracer_save_path = os.path.join(self.workdir, "tracer.json")
+            **kwargs,
+        )
+        self._plan_files: Dict[str, PlanFile] = {}
+
+    async def initialize(self) -> None:
         await super().initialize()
-    
-    async def _get_tracer_and_record(self) -> tuple[Tracer, Record]:
-        """Get tracer and record for current call (coroutine-safe)."""
-        tracer = Tracer()
-        record = Record()
-        
-        if os.path.exists(self.tracer_save_path):
-            await tracer.load_from_json(self.tracer_save_path)
-            last_record = await tracer.get_last_record()
-            if last_record:
-                record = last_record
-        
-        return tracer, record
-    
-    async def _get_agent_context(self, task: str, ctx: SessionContext = None, **kwargs) -> Dict[str, Any]:
-        """Get the agent context including available agents."""
-        # Get base agent context from parent
-        base_context = await super()._get_agent_context(task, ctx=ctx)
-        
-        # Extract the base agent context string
-        base_agent_context = base_context["agent_context"]
-        
-        # Add available agents information
-        available_agents_info = ""
-        try:
-            available_agents = await acp.list()
-            agent_contract = await acp.get_contract()
-            
-            available_agents_info = dedent(f"""
-                <available_agents>
-                Available sub-agents that can be called to complete subtasks:
-                
-                {agent_contract}
-                
-                To call a sub-agent, use the agent's name as a tool. The agent will be invoked through ACP.
-                Each agent accepts a 'task' parameter (required) and optional 'files' parameter.
-                </available_agents>
-            """)
-        except Exception as e:
-            logger.warning(f"| ⚠️ Could not get agent contract: {e}")
-            available_agents_info = dedent(f"""
-                <available_agents>
-                Agent information is currently unavailable. You can still use tools and the todo tool for planning.
-                </available_agents>
-            """)
-        
-        # Insert available agents info before the closing </agent_context> tag
-        # Find the last occurrence of </agent_context> and insert before it
-        agent_context = base_agent_context.replace("</agent_context>", available_agents_info + "\n</agent_context>")
-        
-        return {
-            "agent_context": agent_context,
-        }
-    
-    async def _get_environment_context(self, record: Record = None) -> Dict[str, Any]:
-        """Get the environment state."""
-        environment_context = "<environment_context>"
-        
-        record_observation = {}
-        
-        # Only iterate over environments specified in config, not all registered environments
-        for env_name in config.env_names:
-            env_info = await ecp.get_info(env_name)
-            rule_string = env_info.rules
-            rule_string = dedent(f"""
-                <rules>
-                {rule_string}
-                </rules>
-            """)
-            
-            env_state = await ecp.get_state(env_name)
-            state_string = "<state>"
-            state_string += env_state["state"]
-            extra = env_state["extra"]
-            record_observation[env_name] = extra
-            
-            if "screenshots" in extra:
-                for screenshot in extra["screenshots"]:
-                    state_string += f"\n<img src={screenshot.screenshot_path} alt={screenshot.screenshot_description}/>"
-            state_string += "</state>"
-            
-            environment_context += dedent(f"""
-                <{env_name}>
-                {rule_string}
-                {state_string}
-                </{env_name}>
-            """)
-        
-        if record is not None:
-            record.observation = record_observation
-        
-        environment_context += "</environment_context>"
-        return {
-            "environment_context": environment_context,
-        }
-        
-    async def _think_and_tool(self, messages: List[BaseMessage], task_id: str, step_number: int, ctx: SessionContext = None, record: Record = None) -> Dict[str, Any]:
-        """Think and tool calls for one step, with support for agent calls."""
-        
-        done = False
-        result = None
-        reasoning = None
-        
-        record_tool = {
-            "thinking": None,
-            "evaluation_previous_goal": None,
-            "memory": None,
-            "next_goal": None,
-            "tool": [],
-        }
-        
-        try:
-            think_output = await model_manager(
-                model=self.model_name,
-                messages=messages,
-                response_format=ThinkOutput
-            )
-            think_output = think_output.extra.parsed_model
-            
-            thinking = think_output.thinking
-            evaluation_previous_goal = think_output.evaluation_previous_goal
-            memory = think_output.memory
-            next_goal = think_output.next_goal
-            tools = think_output.tool
-            
-            # Update record tool
-            record_tool["thinking"] = thinking
-            record_tool["evaluation_previous_goal"] = evaluation_previous_goal
-            record_tool["memory"] = memory
-            record_tool["next_goal"] = next_goal
-            
-            logger.info(f"| 💭 Thinking: {thinking[:1000]}...")
-            logger.info(f"| 🎯 Next Goal: {next_goal}")
-            logger.info(f"| 🔧 Tools/Agents to execute: {len(tools)}")
-            
-            # Execute tools/agents sequentially
-            tool_results = []
-            
-            for i, tool in enumerate(tools):
-                logger.info(f"| 📝 Tool/Agent {i+1}/{len(tools)}: {tool.name}")
-                
-                # Execute the tool or agent
-                tool_name = tool.name
-                tool_args = tool.args if tool.args else {}
-                
-                logger.info(f"| 📝 Tool/Agent Name: {tool_name}, Args: {tool_args}")
-                
-                # Check if this is an agent call (agents are available as tools through A2T transformation)
-                # Or we can check if it's in the agent list
-                try:
-                    # Try to get agent info to see if this is an agent
-                    agent_info = await acp.get_info(tool_name)
-                    if agent_info:
-                        # This is an agent call through ACP
-                        logger.info(f"| 🤖 Calling agent: {tool_name}")
-                        agent_task = tool_args.get("task", "")
-                        agent_files = tool_args.get("files", None)
-                        
-                        agent_result = await acp(
-                            name=tool_name,
-                            input={
-                                "task": agent_task,
-                                "files": agent_files
-                            }
-                        )
-                        
-                        # Convert AgentResponse to tool-like result
-                        if hasattr(agent_result, 'success'):
-                            tool_result = agent_result.message if agent_result.success else f"Agent call failed: {agent_result.message}"
-                        else:
-                            tool_result = str(agent_result)
-                        
-                        logger.info(f"| ✅ Agent {i+1} completed successfully")
-                        logger.info(f"| 📄 Results: {str(tool_result)[:1000]}...")
-                        
-                        # Update tool with result
-                        tool_dict = tool.model_dump()
-                        tool_dict["output"] = tool_result
-                        tool_dict["agent_call"] = True
-                        tool_results.append(tool_dict)
-                        
-                        # Update record tool
-                        tool_extra_dict = {}
-                        tool_extra_dict.update(tool_dict)
-                        tool_extra_dict["agent_call"] = True
-                        record_tool["tool"].append(tool_extra_dict)
-                    else:
-                        # This is a regular tool call
-                        input = {
-                            "name": tool_name,
-                            "input": tool_args,
-                            "ctx": ctx
-                        }
-                        tool_response = await tcp(**input)
-                        tool_result = tool_response.message
-                        tool_extra = tool_response.extra if hasattr(tool_response, 'extra') else None
-                        
-                        logger.info(f"| ✅ Tool {i+1} completed successfully")
-                        logger.info(f"| 📄 Results: {str(tool_result)[:1000]}...")
-                        
-                        # Update tool with result
-                        tool_dict = tool.model_dump()
-                        tool_dict["output"] = tool_result
-                        tool_results.append(tool_dict)
-                        
-                        # Update record tool
-                        tool_extra_dict = {}
-                        tool_extra_dict.update(tool_dict)
-                        if tool_extra is not None:
-                            tool_extra_dict['extra'] = tool_extra.model_dump()
-                        record_tool["tool"].append(tool_extra_dict)
-                        
-                        if tool_name == "done":
-                            done = True
-                            result = tool_result
-                            reasoning = tool_extra.data.get('reasoning', None) if tool_extra and tool_extra.data else None
-                            break
-                except Exception as e:
-                    # If agent lookup fails, treat as regular tool
-                    logger.info(f"| 🔧 Treating {tool_name} as regular tool (agent lookup failed: {e})")
-                    input = {
-                        "name": tool_name,
-                        "input": tool_args,
-                        "ctx": ctx
-                    }
-                    tool_response = await tcp(**input)
-                    tool_result = tool_response.message
-                    tool_extra = tool_response.extra if hasattr(tool_response, 'extra') else None
-                    
-                    logger.info(f"| ✅ Tool {i+1} completed successfully")
-                    logger.info(f"| 📄 Results: {str(tool_result)[:1000]}...")
-                    
-                    # Update tool with result
-                    tool_dict = tool.model_dump()
-                    tool_dict["output"] = tool_result
-                    tool_results.append(tool_dict)
-                    
-                    # Update record tool
-                    tool_extra_dict = {}
-                    tool_extra_dict.update(tool_dict)
-                    if tool_extra is not None:
-                        tool_extra_dict['extra'] = tool_extra.model_dump()
-                    record_tool["tool"].append(tool_extra_dict)
-                    
-                    if tool_name == "done":
-                        done = True
-                        result = tool_result
-                        reasoning = tool_extra.data.get('reasoning', None) if tool_extra and tool_extra.data else None
-                        break
-            
-            event_data = {
-                "thinking": thinking,
-                "evaluation_previous_goal": evaluation_previous_goal,
-                "memory": memory,
-                "next_goal": next_goal,
-                "tool": tool_results
-            }
-            
-            # Update record tool
-            if record is not None:
-                record.tool = record_tool
-            
-            # Get memory system name
-            memory_name = self.memory_name
-            
-            await memory_manager.add_event(
-                memory_name=memory_name,
-                step_number=step_number,
-                event_type=EventType.TOOL_STEP,
-                data=event_data,
-                agent_name=self.name,
+
+    # ------------------------------------------------------------------
+    # plan.md lifecycle (called by the bus via kwargs)
+    # ------------------------------------------------------------------
+
+    def get_or_create_plan_file(
+        self,
+        session_id: str,
+        task_id: str,
+        task: str,
+    ) -> PlanFile:
+        """Return the existing PlanFile for a session, or create one."""
+        if session_id not in self._plan_files:
+            plan_path = os.path.join(self.workdir, f"{session_id}.plan.md")
+            self._plan_files[session_id] = PlanFile(
+                path=plan_path,
+                task=task,
                 task_id=task_id,
-                ctx=ctx
+                session_id=session_id,
             )
-            
-        except Exception as e:
-            logger.error(f"| Error in thinking and tool step: {e}")
-        
-        response_dict = {
-            "done": done,
-            "result": result,
-            "reasoning": reasoning
-        }
-        return response_dict
-        
-    async def __call__(self, 
-                  task: str, 
-                  files: Optional[List[str]] = None,
-                  **kwargs
-                  ) -> AgentResponse:
-        """Main entry point for planning agent through acp."""
-        logger.info(f"| 🚀 Starting PlanningAgent: {task}")
-        
-        # Create tracer and record as local variables (coroutine-safe)
-        tracer, record = await self._get_tracer_and_record()
-        
-        if files:
-            logger.info(f"| 📂 Attached files: {files}")
-            files = await asyncio.gather(*[self._extract_file_content(file) for file in files])
-            enhanced_task = await self._generate_enhanced_task(task, files)
-        else:
-            enhanced_task = task
-        
-        ctx = kwargs.get("ctx", None)
+        return self._plan_files[session_id]
+
+    def remove_plan_file(self, session_id: str) -> None:
+        """Clean up in-memory plan state for a completed session."""
+        self._plan_files.pop(session_id, None)
+
+    # ------------------------------------------------------------------
+    # Main call — one LLM round
+    # ------------------------------------------------------------------
+
+    async def __call__(
+        self,
+        task: str,
+        files: Optional[List[str]] = None,
+        ctx: Optional[SessionContext] = None,
+        **kwargs,
+    ) -> AgentResponse:
+        """Execute one planning round.
+
+        Expected kwargs (set by the bus):
+            task_id (str):          top-level task identifier.
+            round_number (int):     current round (1-based).
+            max_rounds (int):       max rounds allowed.
+            agent_contract (str):   markdown description of available agents.
+            execution_history (str): plain-text log of all completed rounds.
+            round_results (dict):   agent_name → {success, result, error}
+                                    from the *previous* round (empty on round 1).
+
+        Returns:
+            AgentResponse with extra.data["decision"] = PlanDecision dict.
+        """
         if ctx is None:
-            ctx = SessionContext()
-        task_id = "task_" + datetime.now().strftime("%Y%m%d-%H%M%S")
-        
-        logger.info(f"| 📝 Context ID: {ctx.id}, Task ID: {task_id}")
-        
-        # Get memory system name
-        memory_name = self.memory_name
-        
-        # Start session
-        await memory_manager.start_session(memory_name=memory_name, ctx=ctx)
-        
-        # Add task start event
-        await memory_manager.add_event(
-            memory_name=memory_name,
-            step_number=0,
-            event_type=EventType.TASK_START,
-            data=dict(task=enhanced_task),
-            agent_name=self.name,
-            task_id=task_id,
-            ctx=ctx
-        )
-        
-        # Initialize messages
-        messages = await self._get_messages(enhanced_task, ctx=ctx, record=record)
-        
-        # Main loop
-        step_number = 0
-        
-        while step_number < self.max_steps:
-            logger.info(f"| 🔄 Step {step_number+1}/{self.max_steps}")
-            
-            # Execute one step
-            response = await self._think_and_tool(messages, task_id, step_number, ctx=ctx, record=record)
-            step_number += 1
-            
-            # Update tracer and save to json
-            await tracer.add_record(observation=record.observation, 
-                                        tool=record.tool,
-                                        task_id=task_id,
-                                        ctx=ctx)
-            await tracer.save_to_json(self.tracer_save_path)
-            
-            messages = await self._get_messages(enhanced_task, ctx=ctx, record=record)
-            
-            if response["done"]:
-                break
-        
-        # Handle max steps reached
-        if step_number >= self.max_steps:
-            logger.warning(f"| 🛑 Reached max steps ({self.max_steps}), stopping...")
-            response = {
-                "done": False,
-                "result": "The task has not been completed.",
-                "reasoning": "Reached the maximum number of steps."
-            }
-        
-        # Add task end event
-        await memory_manager.add_event(
-            memory_name=memory_name,
-            step_number=step_number,
-            event_type=EventType.TASK_END,
-            data=response,
-            agent_name=self.name,
-            task_id=task_id,
-            ctx=ctx
-        )
-        
-        # End session
-        await memory_manager.end_session(memory_name=memory_name, ctx=ctx)
-        
-        # Save tracer to json
-        await tracer.save_to_json(self.tracer_save_path)
-        
-        logger.info(f"| ✅ Agent completed after {step_number}/{self.max_steps} steps")
-        
-        return AgentResponse(
-            success=response["done"],
-            message=response["result"],
-            extra=AgentExtra(
-                data=response
-            )
+            ctx = kwargs.get("ctx") or SessionContext()
+
+        task_id = kwargs.get("task_id", "task_unknown")
+        round_number = kwargs.get("round_number", 1)
+        max_rounds = kwargs.get("max_rounds", 10)
+        agent_contract = kwargs.get("agent_contract", "")
+        execution_history = kwargs.get("execution_history", "")
+        round_results = kwargs.get("round_results", {})
+
+        logger.info(
+            f"| 🧠 PlanningAgent round {round_number}/{max_rounds} "
+            f"(session={ctx.id})"
         )
 
+        # ------------------------------------------------------------------
+        # Update plan.md with results from the PREVIOUS round
+        # ------------------------------------------------------------------
+        plan_file = self.get_or_create_plan_file(ctx.id, task_id, task)
+
+        if round_results and plan_file.rounds:
+            plan_file.rounds[-1].results = round_results
+
+        # ------------------------------------------------------------------
+        # Build LLM messages via prompt_manager
+        # ------------------------------------------------------------------
+        history_text = execution_history if execution_history else "(no rounds completed yet)"
+
+        messages = await prompt_manager.get_messages(
+            prompt_name=self.prompt_name,
+            system_modules={"agent_contract": agent_contract},
+            agent_modules={
+                "task": task,
+                "round_number": str(round_number),
+                "max_rounds": str(max_rounds),
+                "execution_history": history_text,
+            },
+        )
+
+        # ------------------------------------------------------------------
+        # LLM call
+        # ------------------------------------------------------------------
+        try:
+            llm_output = await model_manager(
+                model=self.model_name,
+                messages=messages,
+                response_format=PlanDecision,
+            )
+            decision: PlanDecision = llm_output.extra.parsed_model
+        except Exception as exc:
+            logger.error(f"| PlanningAgent LLM error: {exc}", exc_info=True)
+            decision = PlanDecision(
+                thinking=f"LLM call failed: {exc}",
+                analysis="",
+                plan_update="Planning failed due to LLM error.",
+                dispatches=[],
+                is_done=True,
+                final_result=f"Planning failed: {exc}",
+            )
+
+        logger.info(f"| 📋 Plan: {decision.plan_update[:200]}")
+
+        # ------------------------------------------------------------------
+        # Update plan.md with THIS round's decision
+        # ------------------------------------------------------------------
+
+        # Backfill analysis onto previous round
+        if decision.analysis:
+            plan_file.update_last_analysis(decision.analysis)
+
+        if decision.is_done:
+            plan_file.finalize(
+                result=decision.final_result or "",
+                success=True,
+            )
+            await plan_file.save()
+            logger.info("| PlanningAgent: task complete")
+        elif decision.dispatches:
+            delivery = "BROADCAST" if len(decision.dispatches) > 1 else "UNICAST"
+            agent_names = [d.agent_name for d in decision.dispatches]
+            subtasks = {d.agent_name: d.task for d in decision.dispatches}
+
+            plan_round = PlanRound(
+                number=round_number,
+                goal=decision.plan_update,
+                agents=agent_names,
+                delivery_mode=delivery,
+                subtasks=subtasks,
+                results={},  # will be filled by the bus on the next round
+            )
+            plan_file.add_round(plan_round)
+            await plan_file.save()
+            logger.info(f"| PlanningAgent: dispatching {agent_names}")
+        else:
+            await plan_file.save()
+
+        # ------------------------------------------------------------------
+        # Return decision to the bus
+        # ------------------------------------------------------------------
+        return AgentResponse(
+            success=True,
+            message=decision.plan_update,
+            extra=AgentExtra(
+                data={
+                    "decision": decision.model_dump(),
+                    "plan_path": plan_file.path,
+                },
+            ),
+        )

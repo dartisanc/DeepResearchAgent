@@ -68,6 +68,16 @@ from .trading_strategy import (
     TradingStrategyAgentMessagePrompt,
 )
 
+from .trading_eval import (
+    TradingEvalSystemPrompt,
+    TradingEvalAgentMessagePrompt,
+)
+
+from .planning import (
+    PlanningSystemPrompt,
+    PlanningAgentMessagePrompt,
+)
+
 __all__ = [
     "AnthropicMobileSystemPrompt",
     "AnthropicMobileAgentMessagePrompt",
@@ -107,4 +117,8 @@ __all__ = [
     "GrpoOptimizerImprovementAgentMessagePrompt",
     "TradingStrategySystemPrompt",
     "TradingStrategyAgentMessagePrompt",
+    "TradingEvalSystemPrompt",
+    "TradingEvalAgentMessagePrompt",
+    "PlanningSystemPrompt",
+    "PlanningAgentMessagePrompt",
 ]

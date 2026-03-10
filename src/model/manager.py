@@ -115,6 +115,38 @@ class ModelManager:
                 "reasoning": self.default_reasoning,
                 "max_output_tokens": self.max_tokens,
                 "fallback_model": "openai/gpt-5.1",
+            },
+            {
+                "model_name": "openai/gpt-5.2",
+                "model_type": "responses",
+                "model_id": "gpt-5.1",
+                "reasoning": self.default_reasoning,
+                "max_output_tokens": self.max_tokens,
+                "fallback_model": "openai/gpt-5",
+            },
+            {
+                "model_name": "openai/gpt-5.3",
+                "model_type": "responses",
+                "model_id": "gpt-5.3",
+                "reasoning": self.default_reasoning,
+                "max_output_tokens": self.max_tokens,
+                "fallback_model": "openai/gpt-5",
+            },
+            {
+                "model_name": "openai/gpt-5.4",
+                "model_type": "responses",
+                "model_id": "gpt-5.4",
+                "reasoning": self.default_reasoning,
+                "max_output_tokens": self.max_tokens,
+                "fallback_model": "openai/gpt-5",
+            },
+            {
+                "model_name": "openai/gpt-5.4-pro",
+                "model_type": "responses",
+                "model_id": "gpt-5.4-pro",
+                "reasoning": self.default_reasoning,
+                "max_output_tokens": self.max_tokens,
+                "fallback_model": "openai/gpt-5",
             }
         ]
         
@@ -286,6 +318,45 @@ class ModelManager:
                 "fallback_model": "openrouter/o3",
             },
             {
+                "model_name": "openrouter/gpt-5.3",
+                "model_id": "openai/gpt-5.3",
+                "model_type": "chat/completions",
+                "reasoning": {
+                    "reasoning": {
+                        "enabled": True
+                    }
+                },
+                "temperature": self.default_temperature,
+                "max_completion_tokens": self.max_tokens,
+                "fallback_model": "openrouter/o3",
+            },
+            {
+                "model_name": "openrouter/gpt-5.4",
+                "model_id": "openai/gpt-5.4",
+                "model_type": "chat/completions",
+                "reasoning": {
+                    "reasoning": {
+                        "enabled": True
+                    }
+                },
+                "temperature": self.default_temperature,
+                "max_completion_tokens": self.max_tokens,
+                "fallback_model": "openrouter/o3",
+            },
+            {
+                "model_name": "openrouter/gpt-5.4-pro",
+                "model_id": "openai/gpt-5.4-pro",
+                "model_type": "chat/completions",
+                "reasoning": {
+                    "reasoning": {
+                        "enabled": True
+                    }
+                },
+                "temperature": self.default_temperature,
+                "max_completion_tokens": self.max_tokens,
+                "fallback_model": "openrouter/o3",
+            },
+            {
                 "model_name": "openrouter/o3",
                 "model_id": "openai/o3",
                 "model_type": "chat/completions",
@@ -377,6 +448,32 @@ class ModelManager:
                 "max_completion_tokens": self.max_tokens,
                 "fallback_model": "openrouter/o3",
             },
+            {
+                "model_name": "openrouter/claude-sonnet-4.6",
+                "model_id": "anthropic/claude-sonnet-4.6",
+                "model_type": "chat/completions",
+                "reasoning": {
+                    "reasoning": {
+                        "enabled": True
+                    }
+                },
+                "temperature": self.default_temperature,
+                "max_completion_tokens": self.max_tokens,
+                "fallback_model": "openrouter/o3",
+            },
+            {
+                "model_name": "openrouter/claude-opus-4.6",
+                "model_id": "anthropic/claude-opus-4.6",
+                "model_type": "chat/completions",
+                "reasoning": {
+                    "reasoning": {
+                        "enabled": True
+                    }
+                },
+                "temperature": self.default_temperature,
+                "max_completion_tokens": self.max_tokens,
+                "fallback_model": "openrouter/o3",
+            },
             # Gemini models for chat, vision, audio, video, pdf, etc.
             {
                 "model_name": "openrouter/gemini-2.5-flash",
@@ -408,6 +505,19 @@ class ModelManager:
                 "model_name": "openrouter/gemini-3-pro-preview",
                 "model_type": "chat/completions",
                 "model_id": "google/gemini-3-pro-preview",
+                "reasoning": {
+                    "reasoning": {
+                        "enabled": True
+                    }
+                },
+                "temperature": self.default_temperature,
+                "max_completion_tokens": self.max_tokens,
+                "fallback_model": "openrouter/gemini-2.5-flash",
+            },
+            {
+                "model_name": "openrouter/gemini-3.1-pro-preview",
+                "model_type": "chat/completions",
+                "model_id": "google/gemini-3.1-pro-preview",
                 "reasoning": {
                     "reasoning": {
                         "enabled": True
@@ -768,6 +878,39 @@ class ModelManager:
         await self._create_client(config)
         logger.info(f"Registered model: {config.model_name}")
     
+    def _log_usage(self, model_name: str, result: LLMResponse) -> None:
+        """Log token usage and estimated cost after a model call."""
+        if not result.success or not result.extra or not result.extra.data:
+            return
+        usage = result.extra.data.get("usage")
+        if not usage:
+            return
+
+        # Normalize token field names across providers
+        input_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or usage.get("prompt_token_count") or 0
+        output_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or usage.get("candidates_token_count") or 0
+        total_tokens = usage.get("total_tokens") or usage.get("total_token_count") or (input_tokens + output_tokens)
+
+        # Some providers (e.g. OpenRouter) may include cost directly
+        cost = usage.get("cost")
+        # Anthropic may include cache-related fields
+        cache_creation = usage.get("cache_creation_input_tokens") or 0
+        cache_read = usage.get("cache_read_input_tokens") or 0
+
+        parts = [
+            f"model={model_name}",
+            f"input={input_tokens}",
+            f"output={output_tokens}",
+            f"total={total_tokens}",
+        ]
+        if cache_creation or cache_read:
+            parts.append(f"cache_create={cache_creation}")
+            parts.append(f"cache_read={cache_read}")
+        if cost is not None:
+            parts.append(f"cost=${cost:.6f}")
+
+        logger.info(f"| 💰 Usage: {', '.join(parts)}")
+
     async def __call__(
         self,
         model: str,
@@ -837,6 +980,7 @@ class ModelManager:
                     **kwargs,
                 )
             
+            self._log_usage(current_model, result)
             return result
             
         except Exception as e:
@@ -884,6 +1028,7 @@ class ModelManager:
                             **kwargs,
                         )
                     logger.info(f"| Fallback model {fallback_model} succeeded")
+                    self._log_usage(fallback_model, result)
                     return result
                 except Exception as fallback_error:
                     logger.error(f"| Fallback model {fallback_model} also failed: {fallback_error}")
